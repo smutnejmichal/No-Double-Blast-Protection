@@ -6,7 +6,6 @@ import org.bukkit.enchantments.Enchantment;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.Listener;
-import org.bukkit.event.entity.EntityDamageEvent;
 import org.bukkit.event.entity.EntityExplodeEvent;
 import org.bukkit.inventory.ItemStack;
 import org.bukkit.plugin.java.JavaPlugin;
@@ -18,164 +17,75 @@ import java.util.*;
 
 public class NoDoubleBlastProt extends JavaPlugin implements Listener {
 
-    private final Map<UUID, Long> lastKnockbackTime = new HashMap<>();
-    private final long KNOCKBACK_COOLDOWN = 50;
-
-    private final Map<Location, Long> recentExplosions = new HashMap<>();
+    private final Map<UUID, Long> knockbackCooldown = new HashMap<>();
+    private static final long COOLDOWN_MS = 50;
 
     @Override
     public void onEnable() {
         getServer().getPluginManager().registerEvents(this, this);
-
-        Bukkit.getScheduler().runTaskTimer(this, () -> {
-            long now = System.currentTimeMillis();
-            recentExplosions.entrySet().removeIf(entry -> now - entry.getValue() > 5000);
-        }, 0L, 1200L);
-
         getLogger().info("NoDoubleBlastProt enabled - Catches ALL explosions");
     }
 
     @EventHandler
     public void onEntityExplode(EntityExplodeEvent event) {
-        Location explosionLoc = event.getLocation();
-        trackExplosion(explosionLoc);
-
-        for (Entity entity : event.getEntity().getNearbyEntities(10, 10, 10)) {
-            if (entity instanceof Player) {
-                Player player = (Player) entity;
-
-                double distance = player.getLocation().distance(explosionLoc);
-                if (distance > 8) continue;
-
-                if (hasEnoughBlastProtection(player)) {
-                    applyKnockback(player, explosionLoc);
-                }
-            }
-        }
+        handleExplosion(event.getLocation(), event.getEntity().getNearbyEntities(8, 8, 8));
     }
 
     @EventHandler
     public void onBlockExplode(BlockExplodeEvent event) {
-        Location explosionLoc = event.getBlock().getLocation().add(0.5, 0.5, 0.5);
-        trackExplosion(explosionLoc);
+        Location loc = event.getBlock().getLocation().add(0.5, 0.5, 0.5);
+        handleExplosion(loc, event.getBlock().getWorld().getNearbyEntities(loc, 8, 8, 8));
+    }
 
-        for (Entity entity : event.getBlock().getWorld().getNearbyEntities(explosionLoc, 8, 8, 8)) {
-            if (entity instanceof Player) {
-                Player player = (Player) entity;
+    private void handleExplosion(Location explosionLoc, Iterable<Entity> entities) {
+        for (Entity entity : entities) {
+            if (!(entity instanceof Player player)) continue;
+            if (!hasEnoughBlastProtection(player)) continue;
 
-                double distance = player.getLocation().distance(explosionLoc);
-                if (distance > 8) continue;
-
-                if (hasEnoughBlastProtection(player)) {
-                    applyKnockback(player, explosionLoc);
-                }
-            }
+            applyKnockback(player, explosionLoc);
         }
     }
 
-    @EventHandler
-    public void onEntityDamage(EntityDamageEvent event) {
-        if (!(event.getEntity() instanceof Player)) return;
+    private void applyKnockback(Player player, Location explosionLoc) {
+        long now = System.currentTimeMillis();
+        UUID id = player.getUniqueId();
 
-        Player player = (Player) event.getEntity();
+        Long last = knockbackCooldown.get(id);
+        if (last != null && now - last < COOLDOWN_MS) return;
 
+        knockbackCooldown.put(id, now);
 
-        if (event.getCause() == EntityDamageEvent.DamageCause.ENTITY_EXPLOSION ||
-                event.getCause() == EntityDamageEvent.DamageCause.BLOCK_EXPLOSION) {
+        Vector velocity = calculateKnockback(player.getLocation(), explosionLoc);
+        player.setVelocity(velocity);
 
-
-            Location explosionLoc = findClosestExplosion(player.getLocation());
-            if (explosionLoc == null) {
-                explosionLoc = player.getLocation();
-            }
-
-            if (hasEnoughBlastProtection(player)) {
-                applyKnockback(player, explosionLoc);
-            }
-        }
+        Bukkit.getScheduler().runTaskLater(this, () -> knockbackCooldown.remove(id), 4L);
     }
 
-    private void trackExplosion(Location location) {
-        recentExplosions.put(location, System.currentTimeMillis());
-    }
+    private Vector calculateKnockback(Location playerLoc, Location explosionLoc) {
+        Vector dir = playerLoc.toVector().subtract(explosionLoc.toVector());
 
-    private Location findClosestExplosion(Location playerLoc) {
-        Location closest = null;
-        double closestDist = Double.MAX_VALUE;
-
-        for (Location explosionLoc : recentExplosions.keySet()) {
-            double dist = playerLoc.distance(explosionLoc);
-            if (dist < closestDist && dist < 10) {
-                closestDist = dist;
-                closest = explosionLoc;
-            }
+        if (dir.lengthSquared() < 0.01) {
+            dir.setY(1);
         }
 
-        return closest;
+        dir.normalize();
+        dir.multiply(0.45);
+        dir.setY(dir.getY() + 0.35);
+
+        return dir;
     }
 
     private boolean hasEnoughBlastProtection(Player player) {
         int count = 0;
-        ItemStack[] armor = player.getInventory().getArmorContents();
 
-        for (ItemStack piece : armor) {
-            if (piece != null &&
-                    piece.getType() != Material.AIR &&
-                    piece.hasItemMeta() &&
-                    piece.getItemMeta().hasEnchant(Enchantment.BLAST_PROTECTION)) {
-                count++;
+        for (ItemStack piece : player.getInventory().getArmorContents()) {
+            if (piece == null || piece.getType() == Material.AIR) continue;
+            if (!piece.hasItemMeta()) continue;
+
+            if (piece.getItemMeta().hasEnchant(Enchantment.BLAST_PROTECTION)) {
+                if (++count >= 2) return true;
             }
         }
-        return count >= 2;
-    }
-
-    private void applyKnockback(final Player player, final Location explosionLoc) {
-        long now = System.currentTimeMillis();
-        UUID playerId = player.getUniqueId();
-
-        if (lastKnockbackTime.containsKey(playerId)) {
-            long lastTime = lastKnockbackTime.get(playerId);
-            if (now - lastTime < KNOCKBACK_COOLDOWN) {
-                return;
-            }
-        }
-
-        lastKnockbackTime.put(playerId, now);
-
-        Bukkit.getScheduler().runTask(this, new Runnable() {
-            @Override
-            public void run() {
-                if (player.isOnline() && !player.isDead()) {
-                    Vector knockback = calculateKnockback(player, explosionLoc);
-                    player.setVelocity(knockback);
-                }
-            }
-        });
-
-        Bukkit.getScheduler().runTaskLater(this, new Runnable() {
-            @Override
-            public void run() {
-                lastKnockbackTime.remove(playerId);
-            }
-        }, 3L);
-    }
-
-    private Vector calculateKnockback(Player player, Location explosionLoc) {
-        Vector direction = player.getLocation().toVector()
-                .subtract(explosionLoc.toVector());
-
-        if (direction.lengthSquared() < 0.1) {
-            direction = new Vector(0, 1, 0);
-        }
-
-        direction.normalize();
-
-        double horizontalStrength = 0.45;
-        double verticalStrength = 0.35;
-
-        Vector knockback = direction.multiply(horizontalStrength);
-        knockback.setY(knockback.getY() + verticalStrength);
-
-        return knockback;
+        return false;
     }
 }
